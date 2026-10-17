@@ -214,6 +214,10 @@ pub struct SoftwareRenderer {
     pub(crate) rendering_metrics_collector: Option<Rc<RenderingMetricsCollector>>,
     #[cfg(feature = "systemfonts")]
     pub(crate) text_layout_cache: sharedparley::TextLayoutCache,
+    /// patched: buffers for rendering paths, allocated once with the renderer and then kept,
+    /// see `path::PathBuffers`
+    #[cfg(feature = "path")]
+    pub(crate) path_buffers: RefCell<crate::path::PathBuffers>,
 }
 
 impl Default for SoftwareRenderer {
@@ -228,6 +232,8 @@ impl Default for SoftwareRenderer {
             repaint_buffer_type: Default::default(),
             #[cfg(feature = "systemfonts")]
             text_layout_cache: Default::default(),
+            #[cfg(feature = "path")]
+            path_buffers: Default::default(),
         }
     }
 }

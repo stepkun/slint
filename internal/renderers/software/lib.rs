@@ -544,6 +544,8 @@ impl SoftwareRenderer {
             "buffer of size {} with {pixels_per_line} pixels per line is too small to handle a window of size {size:?}",
             buffer_pixel_count
         );
+        #[cfg(feature = "path")]
+        let mut path_buffers = self.path_buffers.borrow_mut();
         let buffer_renderer = SceneBuilder::new(
             size,
             factor,
@@ -553,6 +555,8 @@ impl SoftwareRenderer {
                 dirty_range_cache: Vec::new(),
                 dirty_region: Default::default(),
                 scale_factor: factor,
+                #[cfg(feature = "path")]
+                path_buffers: &mut path_buffers,
             },
             rotation,
             #[cfg(feature = "systemfonts")]
@@ -1778,6 +1782,9 @@ struct RenderToBuffer<'a, TargetPixelBuffer> {
     dirty_range_cache: Vec<core::ops::Range<i16>>,
     dirty_region: PhysicalRegion,
     scale_factor: ScaleFactor,
+    // patched: the kept path buffers of the renderer
+    #[cfg(feature = "path")]
+    path_buffers: &'a mut path::PathBuffers,
 }
 
 impl<B: target_pixel_buffer::TargetPixelBuffer> RenderToBuffer<'_, B> {
@@ -1823,6 +1830,22 @@ impl<B: target_pixel_buffer::TargetPixelBuffer> RenderToBuffer<'_, B> {
             }
             line = next;
         }
+    }
+
+    // patched: the parts of the dirty region inside the clip of a path, without overlaps,
+    // so that a path is only blended where the buffer is redrawn
+    #[cfg(feature = "path")]
+    fn path_clip_rects(&self, clip: &PhysicalRect) -> alloc::vec::Vec<PhysicalRect> {
+        self.dirty_region
+            .intersection(clip)
+            .iter()
+            .map(|(origin, size)| {
+                PhysicalRect::new(
+                    PhysicalPoint::new(origin.x as i16, origin.y as i16),
+                    PhysicalSize::new(size.width as i16, size.height as i16),
+                )
+            })
+            .collect()
     }
 
     fn process_texture_impl(&mut self, geometry: PhysicalRect, texture: SceneTexture<'_>) {
@@ -1937,7 +1960,15 @@ impl<B: target_pixel_buffer::TargetPixelBuffer> ProcessScene for RenderToBuffer<
         commands: alloc::vec::Vec<path::Command>,
         color: PremultipliedRgbaColor,
     ) {
-        path::render_filled_path(&commands, &path_geometry, &clip_geometry, color, self.buffer);
+        let clip_rects = self.path_clip_rects(&clip_geometry);
+        path::render_filled_path(
+            &commands,
+            &path_geometry,
+            &clip_rects,
+            color,
+            self.path_buffers,
+            self.buffer,
+        );
     }
 
     #[cfg(feature = "path")]
@@ -1949,12 +1980,14 @@ impl<B: target_pixel_buffer::TargetPixelBuffer> ProcessScene for RenderToBuffer<
         color: PremultipliedRgbaColor,
         stroke_style: path::StrokeStyle<'_>,
     ) {
+        let clip_rects = self.path_clip_rects(&clip_geometry);
         path::render_stroked_path(
             &commands,
             &path_geometry,
-            &clip_geometry,
+            &clip_rects,
             color,
             stroke_style,
+            self.path_buffers,
             self.buffer,
         );
     }

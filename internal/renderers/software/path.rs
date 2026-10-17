@@ -5,7 +5,6 @@
 
 use super::PhysicalRect;
 use super::draw_functions::{PremultipliedRgbaColor, TargetPixel};
-use alloc::vec;
 use alloc::vec::Vec;
 use zeno::{Cap, Fill, Join, Mask, Stroke, Style};
 
@@ -58,78 +57,144 @@ pub fn convert_path_data_to_zeno(
     commands
 }
 
+/// patched: largest mask of a band, a path is rasterized in bands of at most this size
+/// (kept permanently, see `PathBuffers`, so it is smaller than a mask for a whole band would be)
+const MAX_MASK_BYTES: usize = 8 * 1024;
+/// patched: rasterizer cells reserved up front (16 bytes each). Bands of 8 KB of the instruments
+/// in ui/ need at most 256 cells (measured with tools/host-check), this leaves room for more.
+const RESERVED_CELLS: usize = 512;
+
+/// patched: buffers for rendering paths, allocated once when the renderer is created and then
+/// kept. Allocating them for every path (the mask of a band, and 16 KB of rasterizer cells in
+/// zeno) needs large free blocks every frame. On an MCU the heap becomes fragmented when
+/// components are created and destroyed, and such an allocation then fails although enough
+/// memory is free in total. Allocated first, they stay at the start of the heap.
+pub struct PathBuffers {
+    mask: Vec<u8>,
+    scratch: zeno::Scratch,
+    // outline of a stroke, it grows to the largest stroked path and is then kept
+    outline: Vec<Command>,
+}
+
+impl Default for PathBuffers {
+    fn default() -> Self {
+        Self {
+            mask: alloc::vec![0; MAX_MASK_BYTES],
+            scratch: zeno::Scratch::with_capacity(RESERVED_CELLS),
+            outline: Vec::new(),
+        }
+    }
+}
+
 /// Common rendering logic for both filled and stroked paths
+///
+/// patched: only the part of the path inside `clip_rects` (the non-overlapping parts of the dirty
+/// region inside the clip) is rasterized, in horizontal bands with a mask of at most
+/// `MAX_MASK_BYTES`. This bounds the memory on MCUs, avoids rasterizing pixels that are not
+/// redrawn, and pixels outside the redrawn region are not blended again.
+/// patched: the mask and the rasterizer cells come from `buffers`, kept by the renderer.
 fn render_path_with_style<T: TargetPixel>(
     commands: &[Command],
     path_geometry: &PhysicalRect,
-    clip_geometry: &PhysicalRect,
+    clip_rects: &[PhysicalRect],
     color: PremultipliedRgbaColor,
     style: zeno::Style,
+    buffers: &mut PathBuffers,
     buffer: &mut impl crate::target_pixel_buffer::TargetPixelBuffer<TargetPixel = T>,
 ) {
-    // The mask needs to be rendered at the full path size
-    let path_width = path_geometry.size.width as usize;
-    let path_height = path_geometry.size.height as usize;
-
-    if path_width == 0 || path_height == 0 {
+    let path_x = path_geometry.origin.x as i32;
+    let path_y = path_geometry.origin.y as i32;
+    let path_width = path_geometry.size.width as i32;
+    let path_height = path_geometry.size.height as i32;
+    if path_width <= 0 || path_height <= 0 || clip_rects.is_empty() {
         return;
     }
 
-    // Create a buffer for the mask output
-    let mut mask_buffer = vec![0u8; path_width * path_height];
+    // bounding box of the clip rectangles, inside the path and the buffer (screen coordinates)
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for clip in clip_rects {
+        x0 = x0.min(clip.origin.x as i32);
+        y0 = y0.min(clip.origin.y as i32);
+        x1 = x1.max(clip.max_x() as i32);
+        y1 = y1.max(clip.max_y() as i32);
+    }
+    let x0 = x0.max(path_x).max(0);
+    let y0 = y0.max(path_y).max(0);
+    let x1 = x1.min(path_x + path_width).min(buffer.line_slice(0).len() as i32);
+    let y1 = y1.min(path_y + path_height).min(buffer.num_lines() as i32);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
 
-    // Render the full path into the mask
-    Mask::new(commands)
-        .size(path_width as u32, path_height as u32)
-        .style(style)
-        .render_into(&mut mask_buffer, None);
-
-    // Calculate the intersection region - only apply within clipped area
-    // clip_geometry is relative to screen, path_geometry is also relative to screen
-    let clip_x_start = clip_geometry.origin.x.max(0) as usize;
-    let clip_y_start = clip_geometry.origin.y.max(0) as usize;
-    let clip_x_end = (clip_geometry.max_x().max(0) as usize).min(buffer.line_slice(0).len());
-    let clip_y_end = (clip_geometry.max_y().max(0) as usize).min(buffer.num_lines());
-
-    let path_x_start = path_geometry.origin.x as isize;
-    let path_y_start = path_geometry.origin.y as isize;
-
-    // Apply the mask only within the clipped region
-    for screen_y in clip_y_start..clip_y_end {
-        let line = buffer.line_slice(screen_y);
-
-        // Calculate the y coordinate in the mask buffer
-        let mask_y = screen_y as isize - path_y_start;
-        if mask_y < 0 || mask_y >= path_height as isize {
-            continue;
+    // patched: a stroke is converted to its outline once, so the bands only rasterize the
+    // filled outline instead of stroking the path again for every band
+    let PathBuffers { mask: mask_buffer, scratch, outline } = buffers;
+    let (commands, style) = match style {
+        Style::Stroke(_) => {
+            outline.clear();
+            let fill = zeno::apply(commands, style, None, outline);
+            (outline.as_slice(), Style::Fill(fill))
         }
+        _ => (commands, style),
+    };
 
-        // Iterate the writable portion of the line directly to avoid indexing by loop variable
-        let line_slice = &mut line[clip_x_start..clip_x_end];
-        for (i, pixel) in line_slice.iter_mut().enumerate() {
-            let screen_x = clip_x_start + i;
+    let width = (x1 - x0) as usize;
+    let band_height = (MAX_MASK_BYTES / width).clamp(1, (y1 - y0) as usize);
 
-            // Calculate the x coordinate in the mask buffer
-            let mask_x = screen_x as isize - path_x_start;
-            if mask_x < 0 || mask_x >= path_width as isize {
+    let mut band_y = y0;
+    while band_y < y1 {
+        let height = band_height.min((y1 - band_y) as usize);
+        let band = &mut mask_buffer[..width * height];
+        band.fill(0);
+
+        // Render the band of the path into the mask, the offset moves it to the band origin
+        Mask::with_scratch(commands, scratch)
+            .size(width as u32, height as u32)
+            .offset(zeno::Vector::new((path_x - x0) as f32, (path_y - band_y) as f32))
+            .style(style)
+            .render_into(band, None);
+
+        let band_end = band_y + height as i32;
+        for clip in clip_rects {
+            let cx0 = (clip.origin.x as i32).max(x0);
+            let cx1 = (clip.max_x() as i32).min(x1);
+            let cy0 = (clip.origin.y as i32).max(band_y);
+            let cy1 = (clip.max_y() as i32).min(band_end);
+            if cx0 >= cx1 || cy0 >= cy1 {
                 continue;
             }
+            let row_width = (cx1 - cx0) as usize;
+            for y in cy0..cy1 {
+                let mask_row =
+                    &band[(y - band_y) as usize * width + (cx0 - x0) as usize..][..row_width];
+                let line = &mut buffer.line_slice(y as usize)[cx0 as usize..cx1 as usize];
 
-            let mask_idx = (mask_y as usize) * path_width + (mask_x as usize);
-            let coverage = mask_buffer[mask_idx];
-
-            if coverage > 0 {
-                // Scale all color components by coverage to maintain premultiplication
-                let coverage_factor = coverage as u16;
-                let alpha_color = PremultipliedRgbaColor {
-                    red: ((color.red as u16 * coverage_factor) / 255) as u8,
-                    green: ((color.green as u16 * coverage_factor) / 255) as u8,
-                    blue: ((color.blue as u16 * coverage_factor) / 255) as u8,
-                    alpha: ((color.alpha as u16 * coverage_factor) / 255) as u8,
-                };
-                T::blend(pixel, alpha_color);
+                for (pixel, &coverage) in line.iter_mut().zip(mask_row) {
+                    match coverage {
+                        0 => {}
+                        255 => T::blend(pixel, color),
+                        _ => {
+                            // Scale all color components by coverage to maintain premultiplication
+                            // (v + (v >> 8) + 1) >> 8 equals v / 255 for all products of two u8,
+                            // without a division, which is slow on MCUs like the Cortex-M0+
+                            let scale = |component: u8| {
+                                let v = component as u32 * coverage as u32;
+                                ((v + (v >> 8) + 1) >> 8) as u8
+                            };
+                            let alpha_color = PremultipliedRgbaColor {
+                                red: scale(color.red),
+                                green: scale(color.green),
+                                blue: scale(color.blue),
+                                alpha: scale(color.alpha),
+                            };
+                            T::blend(pixel, alpha_color);
+                        }
+                    }
+                }
             }
         }
+
+        band_y = band_end;
     }
 }
 
@@ -139,20 +204,23 @@ fn render_path_with_style<T: TargetPixel>(
 /// * `path_geometry` - The full bounding box of the path in screen coordinates
 /// * `clip_geometry` - The clipped region where the path should be rendered (intersection of path and clip)
 /// * `color` - The color to render the path
+/// * `buffers` - patched: the path buffers kept by the renderer
 /// * `buffer` - The target pixel buffer
 pub fn render_filled_path<T: TargetPixel>(
     commands: &[Command],
     path_geometry: &PhysicalRect,
-    clip_geometry: &PhysicalRect,
+    clip_rects: &[PhysicalRect],
     color: PremultipliedRgbaColor,
+    buffers: &mut PathBuffers,
     buffer: &mut impl crate::target_pixel_buffer::TargetPixelBuffer<TargetPixel = T>,
 ) {
     render_path_with_style(
         commands,
         path_geometry,
-        clip_geometry,
+        clip_rects,
         color,
         zeno::Style::Fill(Fill::NonZero),
+        buffers,
         buffer,
     );
 }
@@ -177,9 +245,10 @@ pub struct StrokeStyle<'a> {
 pub fn render_stroked_path<T: TargetPixel>(
     commands: &[Command],
     path_geometry: &PhysicalRect,
-    clip_geometry: &PhysicalRect,
+    clip_rects: &[PhysicalRect],
     color: PremultipliedRgbaColor,
     stroke_style: StrokeStyle<'_>,
+    buffers: &mut PathBuffers,
     buffer: &mut impl crate::target_pixel_buffer::TargetPixelBuffer<TargetPixel = T>,
 ) {
     let mut stroke = Stroke::new(stroke_style.width);
@@ -198,5 +267,5 @@ pub fn render_stroked_path<T: TargetPixel>(
         .dash(stroke_style.dash_array, stroke_style.dash_offset);
 
     let style = Style::Stroke(stroke);
-    render_path_with_style(commands, path_geometry, clip_geometry, color, style, buffer);
+    render_path_with_style(commands, path_geometry, clip_rects, color, style, buffers, buffer);
 }
