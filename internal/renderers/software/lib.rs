@@ -1825,6 +1825,22 @@ impl<B: target_pixel_buffer::TargetPixelBuffer> RenderToBuffer<'_, B> {
         }
     }
 
+    // patched: the parts of the dirty region inside the clip of a path, without overlaps,
+    // so that a path is only blended where the buffer is redrawn
+    #[cfg(feature = "path")]
+    fn path_clip_rects(&self, clip: &PhysicalRect) -> alloc::vec::Vec<PhysicalRect> {
+        self.dirty_region
+            .intersection(clip)
+            .iter()
+            .map(|(origin, size)| {
+                PhysicalRect::new(
+                    PhysicalPoint::new(origin.x as i16, origin.y as i16),
+                    PhysicalSize::new(size.width as i16, size.height as i16),
+                )
+            })
+            .collect()
+    }
+
     fn process_texture_impl(&mut self, geometry: PhysicalRect, texture: SceneTexture<'_>) {
         self.foreach_ranges(&geometry, |line, buffer, extra_left_clip, extra_right_clip| {
             draw_functions::draw_texture_line(
@@ -1937,7 +1953,8 @@ impl<B: target_pixel_buffer::TargetPixelBuffer> ProcessScene for RenderToBuffer<
         commands: alloc::vec::Vec<path::Command>,
         color: PremultipliedRgbaColor,
     ) {
-        path::render_filled_path(&commands, &path_geometry, &clip_geometry, color, self.buffer);
+        let clip_rects = self.path_clip_rects(&clip_geometry);
+        path::render_filled_path(&commands, &path_geometry, &clip_rects, color, self.buffer);
     }
 
     #[cfg(feature = "path")]
@@ -1949,10 +1966,11 @@ impl<B: target_pixel_buffer::TargetPixelBuffer> ProcessScene for RenderToBuffer<
         color: PremultipliedRgbaColor,
         stroke_style: path::StrokeStyle<'_>,
     ) {
+        let clip_rects = self.path_clip_rects(&clip_geometry);
         path::render_stroked_path(
             &commands,
             &path_geometry,
-            &clip_geometry,
+            &clip_rects,
             color,
             stroke_style,
             self.buffer,

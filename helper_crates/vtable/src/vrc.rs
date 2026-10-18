@@ -155,16 +155,18 @@ impl<VTable: VTableMetaDropInPlace, X: HasStaticVTable<VTable>> VRc<VTable, X> {
         let inner = NonNull::new(mem).unwrap();
         assert!(!mem.is_null());
 
+        // patched: the fields are written one by one into the allocation. A whole `VRcInner`
+        // written at once is first built on the stack, one more copy of `data` there: a
+        // component of a few KB then needs several times its size of stack, which a small MCU
+        // doesn't have.
         unsafe {
-            mem.write(VRcInner {
-                vtable: X::STATIC_VTABLE,
-                strong_ref: AtomicU32::new(1),
-                weak_ref: AtomicU32::new(1), // All the VRc together hold a weak_ref to the memory
-                data_offset: 0,
-                data,
-            });
-            (*mem).data_offset =
-                (&(*mem).data as *const _ as usize - mem as *const _ as usize) as u16;
+            core::ptr::addr_of_mut!((*mem).vtable).write(X::STATIC_VTABLE);
+            core::ptr::addr_of_mut!((*mem).strong_ref).write(AtomicU32::new(1));
+            // All the VRc together hold a weak_ref to the memory
+            core::ptr::addr_of_mut!((*mem).weak_ref).write(AtomicU32::new(1));
+            core::ptr::addr_of_mut!((*mem).data).write(data);
+            core::ptr::addr_of_mut!((*mem).data_offset)
+                .write((&(*mem).data as *const _ as usize - mem as *const _ as usize) as u16);
             VRc { inner }
         }
     }
