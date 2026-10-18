@@ -71,6 +71,8 @@ struct PathBuffers {
     scratch: zeno::Scratch,
     // outline of a stroke, it grows to the largest stroked path and is then kept
     outline: Vec<Command>,
+    // the subpaths of the path being rendered, see `BandCommands`
+    subpaths: Vec<Subpath>,
 }
 
 impl Default for PathBuffers {
@@ -79,13 +81,137 @@ impl Default for PathBuffers {
             mask: alloc::vec![0; MAX_MASK_BYTES],
             scratch: zeno::Scratch::new(),
             outline: Vec::new(),
+            subpaths: Vec::new(),
         }
+    }
+}
+
+/// patched: the commands of a subpath (from a MoveTo to the next) and its vertical extent, the
+/// smallest and largest y of its points and control points (the box of a curve lies within
+/// them), in the coordinates of the path
+#[derive(Clone)]
+struct Subpath {
+    commands: core::ops::Range<usize>,
+    top: f32,
+    bottom: f32,
+}
+
+/// patched: collects the subpaths of `commands`
+fn find_subpaths(commands: &[Command], subpaths: &mut Vec<Subpath>) {
+    subpaths.clear();
+    let extend = |subpaths: &mut Vec<Subpath>, index: usize, y: f32| {
+        if let Some(last) = subpaths.last_mut() {
+            last.commands.end = index + 1;
+            last.top = last.top.min(y);
+            last.bottom = last.bottom.max(y);
+        }
+    };
+    for (index, command) in commands.iter().enumerate() {
+        match *command {
+            Command::MoveTo(p) => {
+                subpaths.push(Subpath { commands: index..index + 1, top: p.y, bottom: p.y })
+            }
+            Command::LineTo(p) => extend(subpaths, index, p.y),
+            Command::QuadTo(c, p) => {
+                extend(subpaths, index, c.y);
+                extend(subpaths, index, p.y);
+            }
+            Command::CurveTo(c1, c2, p) => {
+                extend(subpaths, index, c1.y);
+                extend(subpaths, index, c2.y);
+                extend(subpaths, index, p.y);
+            }
+            // a Close has no point, min and max ignore NaN
+            Command::Close => extend(subpaths, index, f32::NAN),
+        }
+    }
+    // commands before the first MoveTo: no subpaths, the whole path is used in every band
+    if subpaths.first().is_none_or(|first| first.commands.start != 0) {
+        subpaths.clear();
+        subpaths.push(Subpath {
+            commands: 0..commands.len(),
+            top: f32::NEG_INFINITY,
+            bottom: f32::INFINITY,
+        });
+    }
+}
+
+/// patched: the commands of the subpaths that reach into the rows `top..bottom` of a band. A
+/// path is rasterized band by band, and zeno processes all its commands in every band: for a
+/// path of many small subpaths (the ticks on the card of the heading indicator) most of that
+/// work is for subpaths that lie completely above or below the band, they have no edges in its
+/// rows and don't change its coverage.
+#[derive(Clone, Copy)]
+struct BandCommands<'a> {
+    commands: &'a [Command],
+    subpaths: &'a [Subpath],
+    top: f32,
+    bottom: f32,
+}
+
+impl Subpath {
+    fn reaches(&self, top: f32, bottom: f32) -> bool {
+        self.bottom >= top && self.top <= bottom
+    }
+}
+
+#[derive(Clone)]
+struct BandCommandsIter<'a> {
+    band: BandCommands<'a>,
+    subpaths: core::slice::Iter<'a, Subpath>,
+    current: core::slice::Iter<'a, Command>,
+}
+
+impl Iterator for BandCommandsIter<'_> {
+    type Item = Command;
+    fn next(&mut self) -> Option<Command> {
+        loop {
+            if let Some(command) = self.current.next() {
+                return Some(*command);
+            }
+            let subpath = self.subpaths.next()?;
+            if subpath.reaches(self.band.top, self.band.bottom) {
+                self.current = self.band.commands[subpath.commands.clone()].iter();
+            }
+        }
+    }
+}
+
+impl<'a> zeno::PathData for BandCommands<'a> {
+    type Commands = BandCommandsIter<'a>;
+    fn commands(&self) -> Self::Commands {
+        BandCommandsIter { band: *self, subpaths: self.subpaths.iter(), current: [].iter() }
     }
 }
 
 i_slint_core::thread_local! {
     // patched: the kept path buffers, like the glyph cache of the renderer
     static PATH_BUFFERS: core::cell::RefCell<PathBuffers> = core::cell::RefCell::default();
+}
+
+/// patched: blends the color with the coverage of a pixel of the mask
+#[inline(always)]
+fn blend_coverage<T: TargetPixel>(pixel: &mut T, coverage: u8, color: PremultipliedRgbaColor) {
+    match coverage {
+        0 => {}
+        255 => T::blend(pixel, color),
+        _ => {
+            // Scale all color components by coverage to maintain premultiplication
+            // (v + (v >> 8) + 1) >> 8 equals v / 255 for all products of two u8,
+            // without a division, which is slow on MCUs like the Cortex-M0+
+            let scale = |component: u8| {
+                let v = component as u32 * coverage as u32;
+                ((v + (v >> 8) + 1) >> 8) as u8
+            };
+            let alpha_color = PremultipliedRgbaColor {
+                red: scale(color.red),
+                green: scale(color.green),
+                blue: scale(color.blue),
+                alpha: scale(color.alpha),
+            };
+            T::blend(pixel, alpha_color);
+        }
+    }
 }
 
 /// Common rendering logic for both filled and stroked paths
@@ -130,7 +256,7 @@ fn render_path_with_style<T: TargetPixel>(
 
     // patched: a stroke is converted to its outline once, so the bands only rasterize the
     // filled outline instead of stroking the path again for every band
-    let PathBuffers { mask: mask_buffer, scratch, outline } = buffers;
+    let PathBuffers { mask: mask_buffer, scratch, outline, subpaths } = buffers;
     let (commands, style) = match style {
         Style::Stroke(_) => {
             outline.clear();
@@ -140,17 +266,31 @@ fn render_path_with_style<T: TargetPixel>(
         _ => (commands, style),
     };
 
+    find_subpaths(commands, subpaths);
+
     let width = (x1 - x0) as usize;
     let band_height = (MAX_MASK_BYTES / width).clamp(1, (y1 - y0) as usize);
 
     let mut band_y = y0;
     while band_y < y1 {
         let height = band_height.min((y1 - band_y) as usize);
+        // patched: only the subpaths that reach into the rows of the band, in the coordinates
+        // of the path, with a margin of one pixel for anti-aliased edges
+        let band_commands = BandCommands {
+            commands,
+            subpaths,
+            top: (band_y - path_y) as f32 - 1.0,
+            bottom: (band_y - path_y) as f32 + height as f32 + 1.0,
+        };
+        if !subpaths.iter().any(|s| s.reaches(band_commands.top, band_commands.bottom)) {
+            band_y += height as i32;
+            continue;
+        }
         let band = &mut mask_buffer[..width * height];
         band.fill(0);
 
         // Render the band of the path into the mask, the offset moves it to the band origin
-        Mask::with_scratch(commands, scratch)
+        Mask::with_scratch(band_commands, scratch)
             .size(width as u32, height as u32)
             .offset(zeno::Vector::new((path_x - x0) as f32, (path_y - band_y) as f32))
             .style(style)
@@ -171,27 +311,25 @@ fn render_path_with_style<T: TargetPixel>(
                     &band[(y - band_y) as usize * width + (cx0 - x0) as usize..][..row_width];
                 let line = &mut buffer.line_slice(y as usize)[cx0 as usize..cx1 as usize];
 
-                for (pixel, &coverage) in line.iter_mut().zip(mask_row) {
-                    match coverage {
-                        0 => {}
-                        255 => T::blend(pixel, color),
-                        _ => {
-                            // Scale all color components by coverage to maintain premultiplication
-                            // (v + (v >> 8) + 1) >> 8 equals v / 255 for all products of two u8,
-                            // without a division, which is slow on MCUs like the Cortex-M0+
-                            let scale = |component: u8| {
-                                let v = component as u32 * coverage as u32;
-                                ((v + (v >> 8) + 1) >> 8) as u8
-                            };
-                            let alpha_color = PremultipliedRgbaColor {
-                                red: scale(color.red),
-                                green: scale(color.green),
-                                blue: scale(color.blue),
-                                alpha: scale(color.alpha),
-                            };
-                            T::blend(pixel, alpha_color);
+                // patched: most of a mask is empty, the box of a path is mostly outside its shape.
+                // The coverage is read an aligned word (4 pixels) at a time, and only words with
+                // coverage are blended pixel by pixel: about a quarter of the loads and branches
+                // for empty pixels (the Cortex-M0+ can't load unaligned words).
+                let (head, words, tail) = bytemuck::pod_align_to::<u8, u32>(mask_row);
+                let (line_head, line) = line.split_at_mut(head.len());
+                let (line_words, line_tail) = line.split_at_mut(words.len() * 4);
+                for (pixel, &coverage) in line_head.iter_mut().zip(head) {
+                    blend_coverage(pixel, coverage, color);
+                }
+                for (pixels, &word) in line_words.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                    if word != 0 {
+                        for (pixel, coverage) in pixels.iter_mut().zip(word.to_ne_bytes()) {
+                            blend_coverage(pixel, coverage, color);
                         }
                     }
+                }
+                for (pixel, &coverage) in line_tail.iter_mut().zip(tail) {
+                    blend_coverage(pixel, coverage, color);
                 }
             }
         }
