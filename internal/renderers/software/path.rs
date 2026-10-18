@@ -189,12 +189,21 @@ i_slint_core::thread_local! {
     static PATH_BUFFERS: core::cell::RefCell<PathBuffers> = core::cell::RefCell::default();
 }
 
-/// patched: blends the color with the coverage of a pixel of the mask
+/// patched: blends the color with the coverage of a pixel of the mask, `opaque` is the pixel of
+/// an opaque color, which covers a pixel completely
 #[inline(always)]
-fn blend_coverage<T: TargetPixel>(pixel: &mut T, coverage: u8, color: PremultipliedRgbaColor) {
+fn blend_coverage<T: TargetPixel>(
+    pixel: &mut T,
+    coverage: u8,
+    color: PremultipliedRgbaColor,
+    opaque: Option<T>,
+) {
     match coverage {
         0 => {}
-        255 => T::blend(pixel, color),
+        255 => match opaque {
+            Some(opaque) => *pixel = opaque,
+            None => T::blend(pixel, color),
+        },
         _ => {
             // Scale all color components by coverage to maintain premultiplication
             // (v + (v >> 8) + 1) >> 8 equals v / 255 for all products of two u8,
@@ -267,6 +276,9 @@ fn render_path_with_style<T: TargetPixel>(
     };
 
     find_subpaths(commands, subpaths);
+    // patched: an opaque color is written instead of blended where it covers a pixel completely,
+    // like TargetPixel::blend_slice does (the ground of the attitude indicator fills half of it)
+    let opaque = (color.alpha == u8::MAX).then(|| T::from_rgb(color.red, color.green, color.blue));
 
     let width = (x1 - x0) as usize;
     let band_height = (MAX_MASK_BYTES / width).clamp(1, (y1 - y0) as usize);
@@ -319,17 +331,21 @@ fn render_path_with_style<T: TargetPixel>(
                 let (line_head, line) = line.split_at_mut(head.len());
                 let (line_words, line_tail) = line.split_at_mut(words.len() * 4);
                 for (pixel, &coverage) in line_head.iter_mut().zip(head) {
-                    blend_coverage(pixel, coverage, color);
+                    blend_coverage(pixel, coverage, color, opaque);
                 }
                 for (pixels, &word) in line_words.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-                    if word != 0 {
-                        for (pixel, coverage) in pixels.iter_mut().zip(word.to_ne_bytes()) {
-                            blend_coverage(pixel, coverage, color);
+                    match (word, opaque) {
+                        (0, _) => {}
+                        (u32::MAX, Some(opaque)) => pixels.fill(opaque),
+                        _ => {
+                            for (pixel, coverage) in pixels.iter_mut().zip(word.to_ne_bytes()) {
+                                blend_coverage(pixel, coverage, color, opaque);
+                            }
                         }
                     }
                 }
                 for (pixel, &coverage) in line_tail.iter_mut().zip(tail) {
-                    blend_coverage(pixel, coverage, color);
+                    blend_coverage(pixel, coverage, color, opaque);
                 }
             }
         }
